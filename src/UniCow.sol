@@ -26,48 +26,18 @@ import {LibMulticaller} from "../lib/multicaller/src/LibMulticaller.sol";
 contract UniCow is BaseHook {
     using SafeCast for uint256;
     using PoolIdLibrary for PoolKey;
-    using LPFeeLibrary for uint24;
-    using StateLibrary for IPoolManager;
-
-    error MustUseDynamicFee();
-    error LiquidityDoesntMeetMinimum();
-    error LiquidityNotInWithdrwalQueue();
-
-    struct PoolInfo {
-        bool hasAccruedFees;
-        address liquidityToken;
-    }
+    using Currency for Currency;
 
     struct OrderObject {
         uint256 minPrice;
         uint256 deadline;
         uint256 amount;
+        bool isZeroForOne; // true if swapping token0 for token1
     }
 
     mapping(PoolId => mapping(address => OrderObject)) public orders;
-
-    uint128 public constant TOTAL_BIPS = 10000;
-
-    constructor(IPoolManager poolManager) BaseHook(poolManager) {}
-
-    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        return Hooks.Permissions({
-            beforeInitialize: true, // Allow to set up the pool
-            afterInitialize: false,
-            beforeAddLiquidity: false,
-            afterAddLiquidity: true, // Allow mint LP token
-            beforeRemoveLiquidity: true, // Allow LP withdrawal delay and burning LP token
-            afterRemoveLiquidity: false,
-            beforeSwap: true, // Allow set up of dynamic swap fee
-            afterSwap: true, // Allow redistribute fee and charge rent
-            beforeDonate: false,
-            afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: true, // Allow redistribute swap fee
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
-        });
-    }
+    mapping(PoolId => mapping(address => uint256)) public userBalances0;
+    mapping(PoolId => mapping(address => uint256)) public userBalances1;
 
     function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
@@ -90,58 +60,78 @@ contract UniCow is BaseHook {
         internal
         returns (bool, BeforeSwapDelta)
     {
-        Order[] storage orderList = orders[poolId];
-        for (uint256 i = 0; i < orderList.length; i++) {
-            Order memory order = orderList[i];
+        bool zeroForOne = params.zeroForOne;
+        uint256 amountSpecified = uint256(params.amountSpecified);
+
+        for (uint256 i = 0; i < orderOwners[poolId].length; i++) {
+            address orderOwner = orderOwners[poolId][i];
+            OrderObject memory order = orders[poolId][orderOwner];
+
             if (
-                order.tokenIn == Currency.unwrap(params.zeroForOne ? key.currency1 : key.currency0)
-                    && order.tokenOut == Currency.unwrap(params.zeroForOne ? key.currency0 : key.currency1)
-                    && order.amountIn >= params.amountSpecified && order.expiry > block.timestamp
+                order.isZeroForOne != zeroForOne && order.deadline > block.timestamp
+                    && (
+                        (zeroForOne && order.minPrice <= params.sqrtPriceLimitX96)
+                            || (!zeroForOne && order.minPrice >= params.sqrtPriceLimitX96)
+                    )
             ) {
-                // Match found, execute COW
-                BalanceDelta delta = BalanceDelta.wrap(0);
-                if (params.zeroForOne) {
-                    delta = BalanceDelta.wrap(
-                        -int256(params.amountSpecified).toInt128(), int256(order.amountOut).toInt128()
-                    );
+                uint256 fillAmount = Math.min(order.amount, amountSpecified);
+                uint256 receiveAmount = (fillAmount * order.minPrice) / 1e18; // Simplified price calculation
+
+                // Execute the COW
+                if (zeroForOne) {
+                    userBalances0[poolId][sender] -= fillAmount;
+                    userBalances1[poolId][orderOwner] -= receiveAmount;
+                    userBalances1[poolId][sender] += receiveAmount;
+                    userBalances0[poolId][orderOwner] += fillAmount;
                 } else {
-                    delta = BalanceDelta.wrap(
-                        int256(order.amountOut).toInt128(), -int256(params.amountSpecified).toInt128()
-                    );
+                    userBalances1[poolId][sender] -= fillAmount;
+                    userBalances0[poolId][orderOwner] -= receiveAmount;
+                    userBalances0[poolId][sender] += receiveAmount;
+                    userBalances1[poolId][orderOwner] += fillAmount;
                 }
 
-                // Transfer tokens
-                IERC20(order.tokenIn).transferFrom(sender, order.owner, params.amountSpecified);
-                IERC20(order.tokenOut).transferFrom(order.owner, sender, order.amountOut);
+                // Update or remove the order
+                if (fillAmount == order.amount) {
+                    delete orders[poolId][orderOwner];
+                } else {
+                    orders[poolId][orderOwner].amount -= fillAmount;
+                }
 
-                // Remove the matched order
-                orderList[i] = orderList[orderList.length - 1];
-                orderList.pop();
+                // Create BeforeSwapDelta
+                int128 amount0 = zeroForOne ? -int128(uint128(fillAmount)) : int128(uint128(receiveAmount));
+                int128 amount1 = zeroForOne ? int128(uint128(receiveAmount)) : -int128(uint128(fillAmount));
+                BeforeSwapDelta delta = toBeforeSwapDelta(BalanceDelta.wrap(amount0, amount1));
 
-                return (true, toBeforeSwapDelta(delta));
+                return (true, delta);
             }
         }
 
         return (false, BeforeSwapDeltaLibrary.ZERO_DELTA);
     }
 
-    function placeOrder(
-        PoolId poolId,
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 amountOut,
-        uint256 expiry
-    ) external {
-        orders[poolId].push(
-            Order({
-                owner: msg.sender,
-                tokenIn: tokenIn,
-                tokenOut: tokenOut,
-                amountIn: amountIn,
-                amountOut: amountOut,
-                expiry: expiry
-            })
-        );
+    function placeOrder(PoolKey calldata key, uint256 minPrice, uint256 deadline, uint256 amount, bool zeroForOne)
+        external
+    {
+        PoolId poolId = key.toId();
+        require(deadline > block.timestamp, "Invalid deadline");
+
+        orders[poolId][msg.sender] =
+            OrderObject({minPrice: minPrice, deadline: deadline, amount: amount, isZeroForOne: zeroForOne});
+
+        // Transfer tokens to the contract
+        if (zeroForOne) {
+            IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount);
+            userBalances0[poolId][msg.sender] += amount;
+        } else {
+            IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount);
+            userBalances1[poolId][msg.sender] += amount;
+        }
     }
+
+    function getOrderOwners(PoolId poolId) internal view returns (address[] memory) {
+        // This function should return an array of addresses that have placed orders for the given poolId
+        // Implementation details depend on how you want to store and retrieve this information
+    }
+
+    // Additional helper functions and logic...
 }
