@@ -28,6 +28,11 @@ contract UniCow is BaseHook {
     using PoolIdLibrary for PoolKey;
     using Currency for Currency;
 
+    event OrderPartiallyFilled(
+        PoolId indexed poolId, address indexed owner, uint256 filledAmount, uint256 remainingAmount, bool isZeroForOne
+    );
+    event OrderCancelled(PoolId indexed poolId, address indexed owner, uint256 cancelledAmount, bool isZeroForOne);
+
     struct OrderObject {
         uint256 minPrice;
         uint256 deadline;
@@ -47,7 +52,7 @@ contract UniCow is BaseHook {
     {
         PoolId poolId = key.toId();
 
-        (bool success, BeforeSwapDelta delta) = tryCOW(poolId, sender, key, params);
+        (bool success, BeforeSwapDelta delta) = findCOW(poolId, sender, key, params);
         if (success) {
             return (this.beforeSwap.selector, delta, 0);
         }
@@ -56,7 +61,7 @@ contract UniCow is BaseHook {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function tryCOW(PoolId poolId, address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params)
+    function findCOW(PoolId poolId, address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params)
         internal
         returns (bool, BeforeSwapDelta)
     {
@@ -68,7 +73,7 @@ contract UniCow is BaseHook {
             OrderObject memory order = orders[poolId][orderOwner];
 
             if (
-                order.isZeroForOne != zeroForOne && order.deadline > block.timestamp
+                order.isZeroForOne != zeroForOne && block.timestamp < order.deadline
                     && (
                         (zeroForOne && order.minPrice <= params.sqrtPriceLimitX96)
                             || (!zeroForOne && order.minPrice >= params.sqrtPriceLimitX96)
@@ -128,10 +133,58 @@ contract UniCow is BaseHook {
         }
     }
 
-    function getOrderOwners(PoolId poolId) internal view returns (address[] memory) {
-        // This function should return an array of addresses that have placed orders for the given poolId
-        // Implementation details depend on how you want to store and retrieve this information
+    function cancelExpiredOrder(PoolKey calldata key) external {
+        PoolId poolId = key.toId();
+        OrderObject memory order = orders[poolId][msg.sender];
+
+        require(order.amount > 0, "No active order");
+        require(block.timestamp > order.deadline, "Order not expired");
+
+        // Calculate the remaining amount
+        uint256 initialBalance =
+            order.isZeroForOne ? userBalances0[poolId][msg.sender] : userBalances1[poolId][msg.sender];
+        uint256 remainingAmount = Math.min(initialBalance, order.amount);
+
+        // Refund the remaining tokens
+        if (order.isZeroForOne) {
+            userBalances0[poolId][msg.sender] -= remainingAmount;
+            IERC20(Currency.unwrap(key.currency0)).transfer(msg.sender, remainingAmount);
+        } else {
+            userBalances1[poolId][msg.sender] -= remainingAmount;
+            IERC20(Currency.unwrap(key.currency1)).transfer(msg.sender, remainingAmount);
+        }
+
+        // Check if the order was partially filled
+        if (remainingAmount < order.amount) {
+            emit OrderPartiallyFilled(
+                poolId, msg.sender, order.amount - remainingAmount, remainingAmount, order.isZeroForOne
+            );
+        }
+
+        // Remove the order
+        delete orders[poolId][msg.sender];
+        removeOrderOwner(poolId, msg.sender);
+
+        emit OrderCancelled(poolId, msg.sender, remainingAmount, order.isZeroForOne);
     }
 
-    // Additional helper functions and logic...
+    function removeOrderOwner(PoolId poolId, address owner) internal {
+        require(isOrderOwner[poolId][owner], "Not an order owner");
+
+        // Find the index of the owner
+        uint256 index;
+        for (uint256 i = 0; i < orderOwners[poolId].length; i++) {
+            if (orderOwners[poolId][i] == owner) {
+                index = i;
+                break;
+            }
+        }
+
+        // Move the last element to the place of the removed one
+        orderOwners[poolId][index] = orderOwners[poolId][orderOwners[poolId].length - 1];
+        orderOwners[poolId].pop();
+
+        // Update the mapping
+        isOrderOwner[poolId][owner] = false;
+    }
 }
