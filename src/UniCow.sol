@@ -66,46 +66,34 @@ contract UniCow is BaseHook {
         returns (bool, BeforeSwapDelta)
     {
         bool zeroForOne = params.zeroForOne;
-        uint256 amountSpecified = uint256(params.amountSpecified);
+        uint256 amountSpecified = uint256(params.amountSpecified < 0 ? -params.amountSpecified : params.amountSpecified);
 
         for (uint256 i = 0; i < orderOwners[poolId].length; i++) {
             address orderOwner = orderOwners[poolId][i];
             OrderObject memory order = orders[poolId][orderOwner];
 
-            if (
-                order.isZeroForOne != zeroForOne && block.timestamp < order.deadline
-                    && (
-                        (zeroForOne && order.minPrice <= params.sqrtPriceLimitX96)
-                            || (!zeroForOne && order.minPrice >= params.sqrtPriceLimitX96)
-                    )
-            ) {
-                uint256 fillAmount = Math.min(order.amount, amountSpecified);
-                uint256 receiveAmount = (fillAmount * order.minPrice) / 1e18; // Simplified price calculation
-
+            if (order.isZeroForOne != zeroForOne && order.deadline > block.timestamp && order.amount >= amountSpecified)
+            {
                 // Execute the COW
                 if (zeroForOne) {
-                    userBalances0[poolId][sender] -= fillAmount;
-                    userBalances1[poolId][orderOwner] -= receiveAmount;
-                    userBalances1[poolId][sender] += receiveAmount;
-                    userBalances0[poolId][orderOwner] += fillAmount;
+                    key.currency0.take(poolManager, sender, amountSpecified, false);
+                    key.currency1.settle(poolManager, orderOwner, amountSpecified, false);
                 } else {
-                    userBalances1[poolId][sender] -= fillAmount;
-                    userBalances0[poolId][orderOwner] -= receiveAmount;
-                    userBalances0[poolId][sender] += receiveAmount;
-                    userBalances1[poolId][orderOwner] += fillAmount;
+                    key.currency1.take(poolManager, sender, amountSpecified, false);
+                    key.currency0.settle(poolManager, orderOwner, amountSpecified, false);
                 }
 
-                // Update or remove the order
-                if (fillAmount == order.amount) {
-                    delete orders[poolId][orderOwner];
+                // Update the order
+                order.amount -= amountSpecified;
+                if (order.amount == 0) {
+                    removeOrderOwner(poolId, orderOwner);
                 } else {
-                    orders[poolId][orderOwner].amount -= fillAmount;
+                    orders[poolId][orderOwner] = order;
                 }
 
                 // Create BeforeSwapDelta
-                int128 amount0 = zeroForOne ? -int128(uint128(fillAmount)) : int128(uint128(receiveAmount));
-                int128 amount1 = zeroForOne ? int128(uint128(receiveAmount)) : -int128(uint128(fillAmount));
-                BeforeSwapDelta delta = toBeforeSwapDelta(BalanceDelta.wrap(amount0, amount1));
+                BeforeSwapDelta delta =
+                    toBeforeSwapDelta(int128(-params.amountSpecified), int128(params.amountSpecified));
 
                 return (true, delta);
             }
