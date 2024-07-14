@@ -38,11 +38,15 @@ contract UniCow is BaseHook {
         address liquidityToken;
     }
 
+    struct OrderObject {
+        uint256 minPrice;
+        uint256 deadline;
+        uint256 amount;
+    }
+
+    mapping(PoolId => mapping(address => OrderObject)) public orders;
+
     uint128 public constant TOTAL_BIPS = 10000;
-    uint128 public constant WITHDRAWAL_FEE_RATIO = 100;
-    mapping(PoolId => PoolInfo) public poolInfo;
-    mapping(PoolId id => uint40) internal _lastChargedEpoch;
-    mapping(PoolId id => mapping(address => mapping(int256 => uint40))) public withdrawalQueue;
 
     constructor(IPoolManager poolManager) BaseHook(poolManager) {}
 
@@ -65,86 +69,79 @@ contract UniCow is BaseHook {
         });
     }
 
-    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
-        external
-        override
-        returns (bytes4)
-    {
-        PoolId poolId = key.toId();
-
-        string memory tokenSymbol = string(
-            abi.encodePacked(
-                "UniV4",
-                "-",
-                IERC20Metadata(Currency.unwrap(key.currency0)).symbol(),
-                "-",
-                IERC20Metadata(Currency.unwrap(key.currency1)).symbol(),
-                "-",
-                Strings.toString(uint256(key.fee))
-            )
-        );
-        address poolToken = address(new UniswapV4ERC20(tokenSymbol, tokenSymbol));
-
-        _setBidToken(poolToken);
-
-        poolInfo[poolId] = PoolInfo({hasAccruedFees: false, liquidityToken: poolToken});
-
-        return this.beforeInitialize.selector;
-    }
-
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        BalanceDelta,
-        bytes calldata hookData
-    ) external override poolManagerOnly returns (bytes4, BalanceDelta) {
-        PoolId poolId = key.toId();
-
-        address payer = abi.decode(hookData, (address));
-        PoolInfo storage pool = poolInfo[poolId];
-
-        int256 liquidity = params.liquidityDelta;
-
-        UniswapV4ERC20(pool.liquidityToken).mint(payer, uint256(liquidity));
-
-        return (this.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
-    }
-
-    function beforeRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata hookData
-    ) external override returns (bytes4) {
-        PoolId poolId = key.toId();
-        PoolInfo storage pool = poolInfo[poolId];
-        address payer = abi.decode(hookData, (address));
-
-        uint40 currentEpoch = _getEpoch(poolId, block.timestamp);
-        IAmAmm.Bid memory _bid = getLastManager(poolId, currentEpoch);
-        uint128 rent = _bid.rent;
-
-        int256 liquidity = params.liquidityDelta;
-
-        uint40 withdrawLiquidityEpoch = withdrawalQueue[poolId][payer][liquidity];
-
-        // delay withdrwal when there's manager
-        if (rent > 0 && (withdrawLiquidityEpoch == 0 || currentEpoch <= withdrawLiquidityEpoch)) {
-            revert LiquidityNotInWithdrwalQueue();
-        }
-        // burn LP token
-        UniswapV4ERC20(pool.liquidityToken).burn(payer, uint256(-liquidity));
-
-        return (this.beforeRemoveLiquidity.selector);
-    }
-
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         override
         poolManagerOnly
         returns (bytes4, BeforeSwapDelta, uint24)
     {
+        PoolId poolId = key.toId();
+
+        (bool success, BeforeSwapDelta delta) = tryCOW(poolId, sender, key, params);
+        if (success) {
+            return (this.beforeSwap.selector, delta, 0);
+        }
+
+        // If no COW match, proceed with regular swap
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+    }
+
+    function tryCOW(PoolId poolId, address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params)
+        internal
+        returns (bool, BeforeSwapDelta)
+    {
+        Order[] storage orderList = orders[poolId];
+        for (uint256 i = 0; i < orderList.length; i++) {
+            Order memory order = orderList[i];
+            if (
+                order.tokenIn == Currency.unwrap(params.zeroForOne ? key.currency1 : key.currency0)
+                    && order.tokenOut == Currency.unwrap(params.zeroForOne ? key.currency0 : key.currency1)
+                    && order.amountIn >= params.amountSpecified && order.expiry > block.timestamp
+            ) {
+                // Match found, execute COW
+                BalanceDelta delta = BalanceDelta.wrap(0);
+                if (params.zeroForOne) {
+                    delta = BalanceDelta.wrap(
+                        -int256(params.amountSpecified).toInt128(), int256(order.amountOut).toInt128()
+                    );
+                } else {
+                    delta = BalanceDelta.wrap(
+                        int256(order.amountOut).toInt128(), -int256(params.amountSpecified).toInt128()
+                    );
+                }
+
+                // Transfer tokens
+                IERC20(order.tokenIn).transferFrom(sender, order.owner, params.amountSpecified);
+                IERC20(order.tokenOut).transferFrom(order.owner, sender, order.amountOut);
+
+                // Remove the matched order
+                orderList[i] = orderList[orderList.length - 1];
+                orderList.pop();
+
+                return (true, toBeforeSwapDelta(delta));
+            }
+        }
+
+        return (false, BeforeSwapDeltaLibrary.ZERO_DELTA);
+    }
+
+    function placeOrder(
+        PoolId poolId,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 expiry
+    ) external {
+        orders[poolId].push(
+            Order({
+                owner: msg.sender,
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                amountIn: amountIn,
+                amountOut: amountOut,
+                expiry: expiry
+            })
+        );
     }
 }
