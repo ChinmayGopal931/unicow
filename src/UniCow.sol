@@ -13,16 +13,17 @@ import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/types/BalanceDelta.sol"
 import {BeforeSwapDelta, toBeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
-import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {CurrencySettler} from "v4-core-test/utils/CurrencySettler.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 contract UniCow is BaseHook {
     using SafeCast for uint256;
-    using PoolIdLibrary for PoolKey;
     using LPFeeLibrary for uint24;
     using CurrencyLibrary for Currency;
     using CurrencySettler for Currency;
     using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     struct OrderObject {
         uint256 minPrice;
@@ -92,7 +93,7 @@ contract UniCow is BaseHook {
     {
         bool zeroForOne = params.zeroForOne;
         uint256 amountSpecified = uint256(params.amountSpecified < 0 ? -params.amountSpecified : params.amountSpecified);
-        (Currency inputCurrency, Currency outputCurrency, uint256 amount) = _getInputOutputAndAmount(key, params);
+        (, Currency outputCurrency,) = _getInputOutputAndAmount(key, params);
 
         for (uint256 i = 0; i < orderOwners[poolId].length; i++) {
             address orderOwner = orderOwners[poolId][i];
