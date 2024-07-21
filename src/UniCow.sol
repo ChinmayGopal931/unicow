@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
+import "forge-std/Test.sol";
 import {BaseHook} from "./forks/BaseHook.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
@@ -15,7 +16,6 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {CurrencySettler} from "v4-core-test/utils/CurrencySettler.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 contract UniCow is BaseHook {
     using SafeCast for uint256;
@@ -68,6 +68,21 @@ contract UniCow is BaseHook {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
+    }
+
+    function unlockCallback(bytes calldata data) external override poolManagerOnly returns (bytes memory) {
+        (address sender, PoolKey memory key, uint256 amountSpecified, bool zeroForOne) =
+            abi.decode(data, (address, PoolKey, uint256, bool));
+
+        if (zeroForOne) {
+            key.currency0.take(poolManager, sender, amountSpecified, false);
+            key.currency1.settle(poolManager, address(this), amountSpecified, false);
+        } else {
+            key.currency1.take(poolManager, sender, amountSpecified, false);
+            key.currency0.settle(poolManager, address(this), amountSpecified, false);
+        }
+
+        return "";
     }
 
     function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
@@ -144,6 +159,7 @@ contract UniCow is BaseHook {
     function placeOrder(PoolKey calldata key, uint256 minPrice, uint256 deadline, uint256 amount, bool zeroForOne)
         external
     {
+        console.log("11");
         PoolId poolId = key.toId();
         require(deadline > block.timestamp, "Invalid deadline");
 
@@ -155,12 +171,15 @@ contract UniCow is BaseHook {
             isOrderOwner[poolId][msg.sender] = true;
         }
 
+        console.log("placeOrder");
+
         // Transfer tokens to the contract
         if (zeroForOne) {
             key.currency0.take(poolManager, msg.sender, amount, false);
         } else {
             key.currency1.take(poolManager, msg.sender, amount, false);
         }
+        console.log("placeOrder");
 
         emit OrderPlaced(poolId, msg.sender, amount, minPrice, deadline, zeroForOne);
     }
